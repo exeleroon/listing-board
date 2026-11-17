@@ -24,3 +24,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL
 );
+
+-- One running sheet per account. The API maps a violation to 409, which keeps
+-- two concurrent POST /start calls from both succeeding.
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_running_per_user
+    ON jobs (user_id) WHERE status = 'running';

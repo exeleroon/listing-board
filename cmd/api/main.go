@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"time"
 
+	"listingboard/internal/brochure"
+	"listingboard/internal/env"
 	"listingboard/internal/httpapi"
 	"listingboard/internal/store"
 )
@@ -19,18 +21,26 @@ func main() {
 	if dsn == "" {
 		log.Fatal("DATABASE_URL is required")
 	}
-	dataDir := env("DATA_DIR", "data")
+	dataDir := env.String("DATA_DIR", "data")
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		log.Fatal(err)
 	}
-	st, err := waitStore(dsn)
+	st, err := store.OpenRetry(dsn, 30*time.Second)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer st.Close()
+	// Volumes written by the previous version keep brochures under the sheet id only.
+	moved, err := brochure.MigrateLegacyLayout(context.Background(), st, dataDir)
+	if err != nil {
+		log.Printf("brochure layout migration: %v", err)
+	}
+	if moved > 0 {
+		log.Printf("moved %d brochure(s) to the current layout", moved)
+	}
 
 	srv := &http.Server{
-		Addr:              ":" + env("PORT", "8080"),
+		Addr:              ":" + env.String("PORT", "8080"),
 		Handler:           httpapi.New(st, dataDir, os.Getenv("WEB_DIR")).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -46,27 +56,4 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
-}
-
-func waitStore(dsn string) (*store.Store, error) {
-	deadline := time.Now().Add(30 * time.Second)
-	var last error
-	for {
-		st, err := store.Open(dsn)
-		if err == nil {
-			return st, nil
-		}
-		last = err
-		if time.Now().After(deadline) {
-			return nil, last
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-}
-
-func env(key, fallback string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return fallback
 }

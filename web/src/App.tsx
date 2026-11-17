@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useState } from "react";
 
 type Step = { label: string; state: string };
 
@@ -8,11 +8,27 @@ type Job = {
   address: string;
   status: string;
   error: string;
+  runId: string;
   filename: string;
   checklist: Step[];
 };
 
 type Account = { id: string; email: string };
+
+// How often the open sheet is re-read while the worker runs it.
+const LIVE_SHEET_INTERVAL_MS = 1000;
+
+// Mirrors the API limit so an oversized file is refused before it is sent.
+const MAX_BROCHURE_BYTES = 1024 * 1024;
+
+class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
+}
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, { credentials: "include", ...init });
@@ -20,9 +36,30 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const data = text ? JSON.parse(text) : null;
   if (!res.ok) {
     const message = data && typeof data.error === "string" ? data.error : res.statusText;
-    throw new Error(message);
+    throw new ApiError(message, res.status);
   }
   return data as T;
+}
+
+function getJob(id: string): Promise<Job> {
+  return api<Job>("/api/jobs/" + id);
+}
+
+function startJob(id: string): Promise<Job> {
+  return api<Job>("/api/jobs/" + id + "/start", { method: "POST" });
+}
+
+function uploadBrochure(id: string, file: File): Promise<Job> {
+  if (file.size > MAX_BROCHURE_BYTES) {
+    return Promise.reject(new Error("Brochure is too large, the limit is 1 MiB"));
+  }
+  const body = new FormData();
+  body.append("file", file);
+  return api<Job>("/api/jobs/" + id + "/file", { method: "POST", body });
+}
+
+function describe(err: unknown, fallback: string): string {
+  return err instanceof Error ? err.message : fallback;
 }
 
 export function App() {
@@ -49,6 +86,16 @@ export function App() {
       .catch((err: Error) => setError(err.message));
   }, [me]);
 
+  // Single place that puts a fresh copy of a sheet into the list and opens it.
+  const showJob = useCallback((job: Job) => {
+    setSelected(job);
+    setJobs((current) =>
+      current.some((item) => item.id === job.id)
+        ? current.map((item) => (item.id === job.id ? job : item))
+        : [job, ...current],
+    );
+  }, []);
+
   if (!ready) {
     return <p className="muted">Loading…</p>;
   }
@@ -69,17 +116,20 @@ export function App() {
             api("/api/logout", { method: "POST" }).finally(() => {
               setMe(null);
               setSelected(null);
+              setError("");
             });
           }}
         >
           Log out
         </button>
       </header>
-      {error ? <p className="error">{error}</p> : null}
+      {/* Always in the layout, so a message appearing does not push the page down. */}
+      <p className="notice error" role="status">
+        {error}
+      </p>
       <Create
-        onCreated={(job) => {
-          setJobs((current) => [job, ...current]);
-          setSelected(job);
+        onSaved={(job) => {
+          showJob(job);
           setError("");
         }}
         onError={setError}
@@ -89,7 +139,14 @@ export function App() {
           {jobs.length === 0 ? <li className="muted">No sheets yet.</li> : null}
           {jobs.map((job) => (
             <li key={job.id}>
-              <button className={selected?.id === job.id ? "row on" : "row"} onClick={() => setSelected(job)}>
+              <button
+                className={selected?.id === job.id ? "row on" : "row"}
+                onClick={() => {
+                  // An error belongs to the action that caused it, not to the next sheet.
+                  setError("");
+                  setSelected(job);
+                }}
+              >
                 <span>
                   <strong>{job.title}</strong>
                   <span className="muted">{job.address}</span>
@@ -99,18 +156,7 @@ export function App() {
             </li>
           ))}
         </ul>
-        {selected ? (
-          <Sheet
-            job={selected}
-            onChange={(job) => {
-              setSelected(job);
-              setJobs((current) => current.map((item) => (item.id === job.id ? job : item)));
-            }}
-            onError={setError}
-          />
-        ) : (
-          <p className="muted">Select a sheet.</p>
-        )}
+        {selected ? <Sheet job={selected} onChange={showJob} onError={setError} /> : <p className="muted">Select a sheet.</p>}
       </section>
     </main>
   );
@@ -133,7 +179,7 @@ function Auth({ onIn }: { onIn: (account: Account) => void }) {
       });
       onIn(account);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not sign in");
+      setError(describe(err, "Could not sign in"));
     }
   }
 
@@ -160,32 +206,43 @@ function Auth({ onIn }: { onIn: (account: Account) => void }) {
   );
 }
 
-function Create({ onCreated, onError }: { onCreated: (job: Job) => void; onError: (message: string) => void }) {
+function Create({ onSaved, onError }: { onSaved: (job: Job) => void; onError: (message: string) => void }) {
   const [title, setTitle] = useState("");
   const [address, setAddress] = useState("");
   const [file, setFile] = useState<File | null>(null);
 
-  async function submit(event: FormEvent) {
+  async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    onError("");
     if (!file) {
       onError("Choose a brochure file");
       return;
     }
+    // Captured before the first await: React drops currentTarget afterwards.
+    const form = event.currentTarget;
+    let job: Job;
     try {
-      const job = await api<Job>("/api/jobs", {
+      job = await api<Job>("/api/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title, address }),
       });
-      const body = new FormData();
-      body.append("file", file);
-      const saved = await api<Job>("/api/jobs/" + job.id + "/file", { method: "POST", body });
-      setTitle("");
-      setAddress("");
-      setFile(null);
-      onCreated(saved);
     } catch (err) {
-      onError(err instanceof Error ? err.message : "Could not create the sheet");
+      onError(describe(err, "Could not create the sheet"));
+      return;
+    }
+    // The sheet exists now; show it even if the brochure is rejected, so the
+    // user can attach another one from the sheet panel.
+    onSaved(job);
+    setTitle("");
+    setAddress("");
+    setFile(null);
+    // The file input is uncontrolled; without this it keeps showing the old name.
+    form.reset();
+    try {
+      onSaved(await uploadBrochure(job.id, file));
+    } catch (err) {
+      onError(describe(err, "Could not store the brochure"));
     }
   }
 
@@ -204,13 +261,61 @@ function Create({ onCreated, onError }: { onCreated: (job: Job) => void; onError
         <input
           type="file"
           accept=".pdf,.txt,application/pdf,text/plain"
-          onChange={(event) => setFile(event.target.files?.[0] ?? null)}
+          onChange={(event) => {
+            onError("");
+            setFile(event.target.files?.[0] ?? null);
+          }}
           required
         />
       </label>
       <button type="submit">Create sheet</button>
     </form>
   );
+}
+
+// Re-reads the sheet while the worker runs it, so the checklist moves without
+// a reload. The first read happens at once, so a sheet opened from a stale
+// list row is corrected immediately. Each later read is scheduled only after
+// the previous one answered, so a slow response can never land after a newer
+// one and move the checklist back. Stops as soon as the sheet leaves running,
+// another one is opened, or the session is gone.
+function useLiveSheet(job: Job, onChange: (job: Job) => void, onError: (message: string) => void) {
+  useEffect(() => {
+    if (job.status !== "running") {
+      return;
+    }
+    let active = true;
+    let timer = 0;
+    let failing = false;
+    const tick = async () => {
+      try {
+        const next = await getJob(job.id);
+        if (!active) {
+          return;
+        }
+        if (failing) {
+          failing = false;
+          onError("");
+        }
+        onChange(next);
+      } catch (err) {
+        if (!active) {
+          return;
+        }
+        failing = true;
+        onError(describe(err, "Could not refresh the sheet"));
+        if (err instanceof ApiError && err.status === 401) {
+          return;
+        }
+      }
+      timer = window.setTimeout(tick, LIVE_SHEET_INTERVAL_MS);
+    };
+    timer = window.setTimeout(tick, 0);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [job.id, job.status, onChange, onError]);
 }
 
 function Sheet({
@@ -222,13 +327,23 @@ function Sheet({
   onChange: (job: Job) => void;
   onError: (message: string) => void;
 }) {
+  useLiveSheet(job, onChange, onError);
+
   async function start() {
     onError("");
     try {
-      const next = await api<Job>("/api/jobs/" + job.id + "/start", { method: "POST" });
-      onChange(next);
+      onChange(await startJob(job.id));
     } catch (err) {
-      onError(err instanceof Error ? err.message : "Could not start the sheet");
+      onError(describe(err, "Could not start the sheet"));
+    }
+  }
+
+  async function attach(file: File) {
+    onError("");
+    try {
+      onChange(await uploadBrochure(job.id, file));
+    } catch (err) {
+      onError(describe(err, "Could not store the brochure"));
     }
   }
 
@@ -237,7 +352,12 @@ function Sheet({
       <h2>{job.title}</h2>
       <p>{job.address}</p>
       <p className={"status " + job.status}>{job.status}</p>
-      {job.filename ? <p className="muted">{job.filename}</p> : null}
+      {job.filename ? (
+        <p className="muted">
+          <a href={"/api/jobs/" + job.id + "/file"}>{job.filename}</a>
+        </p>
+      ) : null}
+      {job.runId ? <p className="muted">run {job.runId}</p> : null}
       {job.error ? <p className="error">{job.error}</p> : null}
       <ol>
         {job.checklist.map((step) => (
@@ -246,6 +366,21 @@ function Sheet({
           </li>
         ))}
       </ol>
+      {job.status === "draft" && !job.filename ? (
+        <label>
+          Attach a brochure
+          <input
+            type="file"
+            accept=".pdf,.txt,application/pdf,text/plain"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) {
+                void attach(file);
+              }
+            }}
+          />
+        </label>
+      ) : null}
       {job.status === "draft" ? <button onClick={start}>Start</button> : null}
     </article>
   );

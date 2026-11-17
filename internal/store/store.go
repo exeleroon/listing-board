@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -12,6 +13,10 @@ import (
 
 	"listingboard/internal/board"
 )
+
+// migrationLock is an arbitrary advisory lock key so the API and the worker
+// can run the schema at the same time without tripping over each other.
+const migrationLock = 725001
 
 type Store struct {
 	db *sql.DB
@@ -37,6 +42,22 @@ func Open(dsn string) (*Store, error) {
 	return s, nil
 }
 
+// OpenRetry keeps calling Open until it succeeds or wait has passed. Both
+// processes start together with Postgres, which is not ready at once.
+func OpenRetry(dsn string, wait time.Duration) (*Store, error) {
+	deadline := time.Now().Add(wait)
+	for {
+		st, err := Open(dsn)
+		if err == nil {
+			return st, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("database not reachable after %s: %w", wait, err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
 func (s *Store) Close() error {
 	return s.db.Close()
 }
@@ -44,8 +65,18 @@ func (s *Store) Close() error {
 func (s *Store) migrate() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err := s.db.ExecContext(ctx, schemaSQL)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, migrationLock); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, schemaSQL); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) CreateUser(ctx context.Context, email, passwordHash string) (board.User, error) {
@@ -95,21 +126,26 @@ func (s *Store) UserByToken(ctx context.Context, token string) (board.User, erro
 }
 
 func (s *Store) ListJobs(ctx context.Context, userID string) ([]board.Job, error) {
-	rows, err := s.db.QueryContext(ctx, jobSelect+` WHERE user_id = $1 ORDER BY created_at DESC`, userID)
+	return s.queryJobs(ctx, jobSelect+` WHERE user_id = $1 ORDER BY created_at DESC`, userID)
+}
+
+func (s *Store) RunningJobs(ctx context.Context) ([]board.Job, error) {
+	return s.queryJobs(ctx, jobSelect+` WHERE status = $1 ORDER BY updated_at ASC`, board.StatusRunning)
+}
+
+func (s *Store) queryJobs(ctx context.Context, query string, args ...any) ([]board.Job, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var jobs []board.Job
+	jobs := []board.Job{}
 	for rows.Next() {
 		job, err := scanJob(rows)
 		if err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
-	}
-	if jobs == nil {
-		jobs = []board.Job{}
 	}
 	return jobs, rows.Err()
 }
@@ -156,9 +192,38 @@ func (s *Store) UpdateJob(ctx context.Context, job board.Job) error {
 	return nil
 }
 
-const jobSelect = `
-	SELECT id, user_id, title, address, status, error, run_id, filename, checklist, created_at, updated_at
-	FROM jobs`
+// StartJob is a conditional update: only a draft can leave for running, so a
+// second concurrent start of the same sheet finds no row and the first runId
+// stays. The partial unique index turns a second running sheet of the same
+// account into ErrConflict.
+func (s *Store) StartJob(ctx context.Context, id, runID string, at time.Time) (board.Job, error) {
+	row := s.db.QueryRowContext(ctx, `
+		UPDATE jobs
+		SET status = $1, run_id = $2, error = '', updated_at = $3
+		WHERE id = $4 AND status = $5
+		RETURNING `+jobColumns, board.StatusRunning, runID, at.UTC(), id, board.StatusDraft)
+	job, err := scanJob(row)
+	if isUnique(err) {
+		return board.Job{}, board.ErrConflict
+	}
+	return job, mapNotFound(err)
+}
+
+// AttachBrochure is a conditional update like StartJob: only a sheet without
+// a filename takes one, so the loser of two concurrent uploads finds no row.
+func (s *Store) AttachBrochure(ctx context.Context, id, filename string, at time.Time) (board.Job, error) {
+	row := s.db.QueryRowContext(ctx, `
+		UPDATE jobs
+		SET filename = $1, updated_at = $2
+		WHERE id = $3 AND filename = ''
+		RETURNING `+jobColumns, filename, at.UTC(), id)
+	job, err := scanJob(row)
+	return job, mapNotFound(err)
+}
+
+const jobColumns = `id, user_id, title, address, status, error, run_id, filename, checklist, created_at, updated_at`
+
+const jobSelect = `SELECT ` + jobColumns + ` FROM jobs`
 
 type scanner interface {
 	Scan(dest ...any) error

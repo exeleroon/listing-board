@@ -91,6 +91,8 @@ button.row.on {
   padding: 0;
   display: grid;
   gap: 8px;
+  /* The column stretches to the sheet's height; rows must not share that space. */
+  align-content: start;
 }
 
 .sheet {
@@ -117,8 +119,17 @@ li.done {
   color: #3d6b45;
 }
 
+.status.running {
+  color: #8a6d1f;
+}
+
 .status.failed, .error {
   color: #8c3a2f;
+}
+
+.notice {
+  min-height: 1.4em;
+  margin: 0 0 16px;
 }
 
 @media (max-width: 720px) {
