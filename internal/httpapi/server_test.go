@@ -16,17 +16,19 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"listingboard/internal/board"
 	"listingboard/internal/brochure"
 	"listingboard/internal/memstore"
+	"listingboard/internal/worker"
 )
 
-// Rewritten from TestStartMarksTheJobSuccessful. The handler no longer finishes
-// the sheet: it hands it to the worker as running, with a fresh runId and every
-// step still pending.
-func TestStartMarksTheJobRunning(t *testing.T) {
-	srv, _ := newTestServer(t)
+// Rewritten for the spec: the handler no longer finishes the sheet. POST /start
+// hands it to the worker as running, with a fresh runId and every step still
+// pending, and only the worker marks it successful, keeping that runId.
+func TestStartMarksTheJobSuccessful(t *testing.T) {
+	srv, dir := newTestServer(t)
 	cookie := signUp(t, srv, "ada@example.com")
 	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
 	uploadFile(t, srv, cookie, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
@@ -53,6 +55,23 @@ func TestStartMarksTheJobRunning(t *testing.T) {
 	stored := getSheet(t, srv, cookie, job.ID)
 	if stored.Status != board.StatusRunning || stored.RunID != got.RunID {
 		t.Fatalf("stored sheet is %s with runId %q, want running with %q", stored.Status, stored.RunID, got.RunID)
+	}
+
+	// The worker, not the handler, walks the checklist and finishes the sheet.
+	if err := worker.New(srv.store, dir, 0, time.Millisecond).Process(context.Background(), job.ID); err != nil {
+		t.Fatal(err)
+	}
+	done := getSheet(t, srv, cookie, job.ID)
+	if done.Status != board.StatusSuccess {
+		t.Fatalf("status %s after the worker, want success", done.Status)
+	}
+	if done.RunID != got.RunID {
+		t.Fatalf("runId changed from %q to %q", got.RunID, done.RunID)
+	}
+	for _, step := range done.Checklist {
+		if step.State != board.StepDone {
+			t.Fatalf("step %q is %s, want done", step.Label, step.State)
+		}
 	}
 }
 
@@ -140,9 +159,9 @@ func TestSheetOfAnotherAccountIsNotFound(t *testing.T) {
 	}
 }
 
-// Rewritten from TestUploadKeepsTheClientFilename. The client name is kept in
-// the sheet's filename field only; the bytes live at {DATA_DIR}/{userID}/{jobID}/body.
-func TestUploadStoresTheBodyUnderUserAndJob(t *testing.T) {
+// Rewritten for the spec: the client name is kept in the sheet's filename
+// field only; the bytes live at {DATA_DIR}/{userID}/{jobID}/body and nowhere else.
+func TestUploadKeepsTheClientFilename(t *testing.T) {
 	srv, dir := newTestServer(t)
 	cookie := signUp(t, srv, "ada@example.com")
 	me := whoAmI(t, srv, cookie)

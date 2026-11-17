@@ -17,12 +17,14 @@ in-memory store. The race itself I checked against the real stack: with
 fired in parallel, exactly one returned 200 and one 409, and Postgres showed a
 single `running` row for the account.
 
-**Also worth knowing.** The two tests the README names were rewritten and
-renamed to describe the spec (`TestStartMarksTheJobSuccessful` ->
-`TestStartMarksTheJobRunning`, `TestUploadKeepsTheClientFilename` ->
-`TestUploadStoresTheBodyUnderUserAndJob`); each carries a comment with its old
-name. `POST /start` on a `failed` or `success` sheet answers 409, since the
-README only says a failed sheet stays failed and leaves the status code open.
+**Also worth knowing.** The two tests the README names keep their names and now
+describe the spec: `TestStartMarksTheJobSuccessful` checks that the handler
+only moves the sheet to `running` and that the worker is what makes it
+`success` with the same `runId`; `TestUploadKeepsTheClientFilename` checks that
+the client name lives in `filename` only while the bytes sit at
+`{DATA_DIR}/{userID}/{jobID}/body`. `POST /start` on a `failed` or `success`
+sheet answers 409, since the README only says a failed sheet stays failed and
+leaves the status code open.
 The API moves brochures from the previous on-disk layout (`{DATA_DIR}/{jobID}/{name}`)
 into place on start, so a `boarddata` volume written by the original code keeps
 working. Uploads of one sheet are guarded the same way as starts: the bytes are
